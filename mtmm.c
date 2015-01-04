@@ -207,7 +207,7 @@ to heap 0 (the global heap).
 */
 void free (void * ptr) 
 {
-	DBG_ENTRY;
+	//DBG_ENTRY;
 	if (ptr != NULL)
     	{
 		size_t size = ((tBlockNode *)(ptr - sizeof(tBlockNode))) -> size + sizeof(tBlockNode);
@@ -218,7 +218,7 @@ void free (void * ptr)
 			deallocateLargeMemoryChunk(ptr, size);
 		}
 	}	
-	DBG_EXIT;
+	//DBG_EXIT;
 	
 }
 
