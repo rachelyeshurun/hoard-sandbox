@@ -5,6 +5,11 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <pthread.h>
+
+
+#include <stdint.h>
+typedef uint64_t pthread_id_np_t;
 
 #include "mtmm.h"
 #if 1
@@ -74,7 +79,8 @@ Note: don't forget to check return values!
 
   */
   
-#define MAX_NUM_HEAPS		2
+#define NUM_HEAPS			2
+#define GLOBAL_HEAP			0
 /* log2(SUPERBLOCK_SIZE) */
 #define NUM_SIZE_CLASSES	16	
 
@@ -123,7 +129,7 @@ typedef struct sHeap
 typedef struct sHoard
 {
 	unsigned int		numHeaps;
-	tHeap				heapArray[MAX_NUM_HEAPS];
+	tHeap				heapArray[NUM_HEAPS];
 }tHoard;
 
 /* Heaps are defined as a static array in the heap - reside in the data segment */
@@ -131,6 +137,9 @@ typedef struct sHoard
 
 static void *	allocateLargeMemoryChunk(size_t	sz);
 static void		deallocateLargeMemoryChunk(void * ptr, size_t sz);
+
+/* Gets an index into the heap array based on the current thread's processor id */
+static int		getHeapNumber(unsigned int *pHeapNumber);
 /*
 
 The malloc() function allocates size bytes and returns a pointer to the allocated memory. 
@@ -161,7 +170,8 @@ malloc (sz)
 
 void * malloc (size_t sz)
 {	
-	void *p;
+	void			*p;
+	unsigned int 	heapNum = GLOBAL_HEAP;
 	
 	DBG_EXIT;
 	
@@ -178,7 +188,23 @@ void * malloc (size_t sz)
 		return p;
 	}
 	
-	return 0;
+	/* hash to the correct heap */
+	if (!getHeapNumber(&heapNum))
+	{
+		perror(NULL);
+		return 0;
+	}
+	
+	DBG_MSG("heap =  %d\n", heapNum);
+	
+	/* below is just placeholder... */
+	p = allocateLargeMemoryChunk(sz);
+		if (!p)
+		{
+			perror(NULL);
+			return 0;
+		}
+		return p;
 	DBG_EXIT;
 }
 
@@ -206,8 +232,7 @@ to heap 0 (the global heap).
 13. Unlock heap i and the superblock.
 */
 void free (void * ptr) 
-{
-	//DBG_ENTRY;
+{  
 	if (ptr != NULL)
     	{
 		size_t size = ((tBlockNode *)(ptr - sizeof(tBlockNode))) -> size + sizeof(tBlockNode);
@@ -217,9 +242,7 @@ void free (void * ptr)
 
 			deallocateLargeMemoryChunk(ptr, size);
 		}
-	}	
-	//DBG_EXIT;
-	
+	}		
 }
 
 /*
@@ -280,4 +303,16 @@ static void deallocateLargeMemoryChunk(void * ptr, size_t sz)
 
 
 	DBG_EXIT;
+}
+
+static int		getHeapNumber(unsigned int *pHeapNumber)
+{
+	pthread_t         self;
+	self = pthread_self();
+	
+	DBG_MSG("self =  0x%.8x\n", (unsigned)self);
+	
+	/* trying to reduce the probability that two threads will use the same heap */
+	*pHeapNumber = ((self >> 12) % NUM_HEAPS) + 1;
+	return 1;	
 }
