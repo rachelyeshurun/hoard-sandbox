@@ -91,7 +91,7 @@ Note: don't forget to check return values!
 typedef struct sBlockNode
 {
 	unsigned int		isFree;							/* 1 if block is free memory, otherwise 0 */
-	struct sBlockNode	*pNext;							/* pointer to next block node in the LIFO list of free blocks (only relevant if free = 1)*/
+	//struct sBlockNode	*pNext;							/* pointer to next block node in the LIFO list of free blocks (only relevant if free = 1)*/
 	unsigned int		size;							/* size of allocated memory as available for user */
 	struct sSuperblock	*pMySuperblock;					/* pointer back to superblock that contains this block */
 } tBlockNode;
@@ -105,7 +105,7 @@ typedef struct sSuperblock
 	unsigned int 		numBlocks; 						/* SUPERBLOCK_SIZE/blockSize */
 	tBlockNode			*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
 	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/				
-	tBlockNode			*pFreeBlocksTail; 				/* LIFO linked list of free block nodes */
+	//tBlockNode			*pFreeBlocksTail; 				/* LIFO linked list of free block nodes */
 }tSuperblock;
 
 /* A collection of superblocks. Each superblock is divided into blocks of equal size, each equalling this class's size */
@@ -140,6 +140,13 @@ static void		deallocateLargeMemoryChunk(void * ptr, size_t sz);
 
 /* Gets an index into the heap array based on the current thread's processor id */
 static int		getHeapNumber(unsigned int *pHeapNumber);
+
+/* Get size class by rounding up requested size to next highest power of 2, return that power. */
+static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo);
+
+/* Allocate memory (memmap) for the superblock */
+static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum);
+
 /*
 
 The malloc() function allocates size bytes and returns a pointer to the allocated memory. 
@@ -172,6 +179,8 @@ void * malloc (size_t sz)
 {	
 	void			*p;
 	unsigned int 	heapNum = GLOBAL_HEAP;
+	unsigned int	requestedBlockSize = 0;
+	int				sizeClassIndex;
 	
 	DBG_EXIT;
 	
@@ -197,14 +206,25 @@ void * malloc (size_t sz)
 	
 	DBG_MSG("heap =  %d\n", heapNum);
 	
+	if (!getSizeClass (sz, &sizeClassIndex))
+	{
+		perror(NULL);
+		return 0;
+	}
+	DBG_MSG("sizeClassIndex =  %d\n", sizeClassIndex);
+	requestedBlockSize = 1 << sizeClassIndex;
+	DBG_MSG("requestedBlockSize =  %d\n", requestedBlockSize);
+	
 	/* below is just placeholder... */
+	p = createSuperblock(requestedBlockSize, heapNum);
+	
 	p = allocateLargeMemoryChunk(sz);
 		if (!p)
 		{
 			perror(NULL);
 			return 0;
 		}
-		return p;
+	return p;
 	DBG_EXIT;
 }
 
@@ -315,4 +335,69 @@ static int		getHeapNumber(unsigned int *pHeapNumber)
 	/* trying to reduce the probability that two threads will use the same heap */
 	*pHeapNumber = ((self >> 12) % NUM_HEAPS) + 1;
 	return 1;	
+}
+
+/* Get size class by rounding up requested size to next highest power of 2, return that power. */
+static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo)
+{
+	int		count = 0;
+	int		dividedByTwo = requestedSize -1; /*subtracting 1 so that if the requested size is exact power, we won't round up */
+	
+	while (dividedByTwo)
+	{
+		dividedByTwo = dividedByTwo/2;
+		count++;
+	}
+
+	*pNextPowerOfTwo = count;
+	return 1;
+}
+
+static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
+{
+	int 		fd;
+	void		*p;
+	size_t		actualSuperblockSize = 0;
+	int			numBlocks;
+	tSuperblock *pNewSuperblock 		= 0;
+
+	DBG_ENTRY;	
+		
+	fd = open("/dev/zero", O_RDWR);
+	
+	if (fd == -1){
+		return 0;
+	}
+	
+	pNewSuperblock = mmap(0, sizeof(tSuperblock), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);	
+	
+	if (pNewSuperblock == MAP_FAILED){
+		close(fd);
+		return 0;
+	}
+	DBG_MSG("pNewSuperblock =  0x%X blockSize=%d\n", (unsigned int)pNewSuperblock, blockSize);
+	/* calculate actual superblock size including the block headers */
+	numBlocks = SUPERBLOCK_SIZE/blockSize;
+	DBG_MSG("numBlocks =  %d\n", numBlocks);
+	actualSuperblockSize = numBlocks * (sizeof(tBlockNode) + blockSize);
+	DBG_MSG("actualSuperblockSize =  %d\n", actualSuperblockSize);
+	p = mmap(0, actualSuperblockSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);	
+	close(fd);
+
+	if (p == MAP_FAILED){
+		return 0;
+	}
+DBG_MSG("p =  0x%X\n", (unsigned int)p);
+	/* Initialize the superblock structure (could be a separate function) */
+	pNewSuperblock->pPrev = 0;
+	pNewSuperblock->pNext = 0;						
+	pNewSuperblock->blockSize = blockSize;
+	pNewSuperblock->heapNum = heapNum;
+	pNewSuperblock->numBlocks = numBlocks;
+	pNewSuperblock->pBlockArray = p;
+	pNewSuperblock->numFreeBlocks = numBlocks;			
+	//pNewSuperblock->pFreeBlocksTail;
+	DBG_MSG("pNewSuperblock->pBlockArray =  0x%X\n", (unsigned int)pNewSuperblock->pBlockArray);
+	DBG_EXIT;
+	return pNewSuperblock;	
 }
