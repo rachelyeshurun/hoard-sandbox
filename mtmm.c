@@ -96,17 +96,17 @@ typedef struct sSuperblock
 	unsigned int		blockSize; 						/* all blocks are same size : 2^classIndex where classIndex is 0-15 */
 	unsigned int		heapNum;						/* index into the heap array to the heap this superblock belongs to */
 	unsigned int 		numBlocks; 						/* SUPERBLOCK_SIZE/blockSize */
-	tBlockNode			*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
+	tBlockNode		*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
 	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/				
-	tBlockNode			*pFreeBlocksTail; 				/* LIFO linked list of free block nodes */
+	tBlockNode		*pFreeBlocksTail; 				/* LIFO linked list of free block nodes */
 }tSuperblock;
 
 /* A collection of superblocks. Each superblock is divided into blocks of equal size, each equalling this class's size */
 typedef struct sSizeClass
 {
 	unsigned int		size;							/* class size: 0 if superblock completely empty and not yet classified. otherwise ranges from 2^0 to 2^15 */
-	tSuperblock			*pHead;							/* superblocks ordered from most full to least full */
-	tSuperblock			*pTail;	
+	tSuperblock		*pHead;							/* superblocks ordered from most full to least full */
+	tSuperblock		*pTail;	
 }tSizeClass;
 
 typedef struct sHeap
@@ -114,19 +114,19 @@ typedef struct sHeap
 	unsigned int		processorId; 					/* one heap per CPU */
 	unsigned long		statMemoryInUse;				/* The amount of memory in use by this heap */
 	unsigned long		statMemoryHeld;					/* The amount of memory held in this heap that was allocated from the operating system */
-	tSizeClass			sizeClasses[NUM_SIZE_CLASSES]; 	/* hold size classed for all sizes from 1 to log2(SUPERBLOCK_SIZE) */	
-	tSizeClass			emptySuperblocks;				/* completely empty superblocks are recycled for use by any size class */	
+	tSizeClass		sizeClasses[NUM_SIZE_CLASSES]; 	/* hold size classed for all sizes from 1 to log2(SUPERBLOCK_SIZE) */	
+	tSizeClass		emptySuperblocks;				/* completely empty superblocks are recycled for use by any size class */	
 } tHeap;
 
 
 typedef struct sHoard
 {
 	unsigned int		numHeaps;
-	tHeap				heapArray[MAX_NUM_HEAPS];
+	tHeap			heapArray[MAX_NUM_HEAPS];
 }tHoard;
 
 /* Heaps are defined as a static array in the heap - reside in the data segment */
-static tHoard		s_hoard;	
+static tHoard			s_hoard;	
 
 typedef struct sHeader
 {
@@ -217,18 +217,12 @@ void free (void * ptr)
 {
 
 	if (ptr != NULL)
-    {
+    	{
 		int size = ((tBlockNode *)(ptr - sizeof(tBlockNode))) -> size + sizeof(tBlockNode);
 		
 		if (size >= HOARD_THRESHOLD_MEM_SIZE)
 		{
-			    deallocateLargeMemoryChunk(ptr, size);
-			if (!p)
-			{
-				perror(NULL);
-				return 0;
-			}
-			return p;
+			deallocateLargeMemoryChunk(ptr, size);
 		}
 	}	
 	printf("myfree\n");
