@@ -379,7 +379,10 @@ static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
 	/* calculate actual superblock size including the block headers */
 	numBlocks = SUPERBLOCK_SIZE/blockSize;
 	DBG_MSG("numBlocks =  %d\n", numBlocks);
-	actualSuperblockSize = numBlocks * (sizeof(tBlockNode) + blockSize);
+	
+	//actualSuperblockSize = numBlocks * (sizeof(tBlockNode) + blockSize);
+	
+	actualSuperblockSize = SUPERBLOCK_SIZE * sizeof(tBlockNode) + SUPERBLOCK_SIZE;
 	DBG_MSG("actualSuperblockSize =  %d\n", actualSuperblockSize);
 	p = mmap(0, actualSuperblockSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);	
 	close(fd);
