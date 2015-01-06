@@ -85,16 +85,25 @@ Note: don't forget to check return values!
 #define NUM_SIZE_CLASSES	16	
 
 /* threshold for using hoard. If memory requested is more than this, then just mmap and return pointer to user */
-#define HOARD_THRESHOLD_MEM_SIZE	SUPERBLOCK_SIZE/2			
+#define HOARD_THRESHOLD_MEM_SIZE	SUPERBLOCK_SIZE/2		
+
+/* fullness threshold : actually defines 'how empty' a heap needs to be before one of its empty enough superblocks is moved to the global heap.
+The criteria for moving an empty enough superblock to the global heap is: u(i) < a(i) − K ∗ S and u(i) < (1 − f)a(i)) 
+where a(i) is the amount of memory in use by heap i, a(i) is the amount of memory originally allocated for heap i from the OS, f is fullness and K 
+is number of empty enough superblocks.
+E.g. when f=1/4 and K=0, heap will move one of its superblocks that is less than 75% full if the heap's total memory in use is
+less than 75% of the total memory allocated to that heap. */
+#define FULLNESS_THRESHOLD_F			0.25
+#define SUPERBLOCK_EMPTY_THRESHHOLD_K	0						
+	
 
 /* header of memory block */ 
-typedef struct sBlockNode
+typedef struct sBlockHeader
 {
-	unsigned int		isFree;							/* 1 if block is free memory, otherwise 0 */
-	//struct sBlockNode	*pNext;							/* pointer to next block node in the LIFO list of free blocks (only relevant if free = 1)*/
+	unsigned int		inUse;							/* 1 if block is allocated to user, otherwise 0 */
 	unsigned int		size;							/* size of allocated memory as available for user */
 	struct sSuperblock	*pMySuperblock;					/* pointer back to superblock that contains this block */
-} tBlockNode;
+} tBlockHeader;
 
 typedef struct sSuperblock
 {
@@ -103,9 +112,8 @@ typedef struct sSuperblock
 	unsigned int		blockSize; 						/* all blocks are same size : 2^classIndex where classIndex is 0-15 */
 	unsigned int		heapNum;						/* index into the heap array to the heap this superblock belongs to */
 	unsigned int 		numBlocks; 						/* SUPERBLOCK_SIZE/blockSize */
-	tBlockNode			*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
-	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/				
-	//tBlockNode			*pFreeBlocksTail; 				/* LIFO linked list of free block nodes */
+	tBlockHeader		*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
+	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/			
 }tSuperblock;
 
 /* A collection of superblocks. Each superblock is divided into blocks of equal size, each equalling this class's size */
@@ -146,6 +154,9 @@ static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo);
 
 /* Allocate memory (memmap) for the superblock */
 static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum);
+
+/* Initialize the superblock for a given size class and heap */
+static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapNum);
 
 /*
 
@@ -255,7 +266,7 @@ void free (void * ptr)
 {  
 	if (ptr != NULL)
     	{
-		size_t size = ((tBlockNode *)(ptr - sizeof(tBlockNode))) -> size + sizeof(tBlockNode);
+		size_t size = ((tBlockHeader *)(ptr - sizeof(tBlockHeader))) -> size + sizeof(tBlockHeader);
 		
 		if (size >= HOARD_THRESHOLD_MEM_SIZE)
 		{
@@ -299,28 +310,27 @@ static void *	allocateLargeMemoryChunk(size_t	sz)
 		return 0;
 	}
 	
-	p = mmap(0, sz + sizeof(tBlockNode), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	p = mmap(0, sz + sizeof(tBlockHeader), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 	close(fd);
 
 	if (p == MAP_FAILED){
 		return 0;
 	}
 
-	((tBlockNode *) p) -> size = sz;
+	((tBlockHeader *) p) -> size = sz;
 
 	DBG_EXIT;
-	return (p + sizeof(tBlockNode));	
+	return (p + sizeof(tBlockHeader));	
 }
 
 static void deallocateLargeMemoryChunk(void * ptr, size_t sz)
 {
 	DBG_ENTRY;
 	
-	if (munmap(ptr - sizeof(tBlockNode), sz) < 0)
+	if (munmap(ptr - sizeof(tBlockHeader), sz) < 0)
 	{
 		perror(NULL);
 	}
-
 
 	DBG_EXIT;
 }
@@ -356,11 +366,9 @@ static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo)
 static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
 {
 	int 		fd;
-	void		*p;
-	size_t		actualSuperblockSize = 0;
-	int			numBlocks;
-	tSuperblock *pNewSuperblock 		= 0;
-
+	tSuperblock *pNewSuperblock	= 0;
+	void		*p				= 0;
+  
 	DBG_ENTRY;	
 		
 	fd = open("/dev/zero", O_RDWR);
@@ -375,32 +383,60 @@ static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
 		close(fd);
 		return 0;
 	}
-	DBG_MSG("pNewSuperblock =  0x%X blockSize=%d\n", (unsigned int)pNewSuperblock, blockSize);
-	/* calculate actual superblock size including the block headers */
-	numBlocks = SUPERBLOCK_SIZE/blockSize;
-	DBG_MSG("numBlocks =  %d\n", numBlocks);
 	
-	//actualSuperblockSize = numBlocks * (sizeof(tBlockNode) + blockSize);
-	
-	actualSuperblockSize = SUPERBLOCK_SIZE * sizeof(tBlockNode) + SUPERBLOCK_SIZE;
-	DBG_MSG("actualSuperblockSize =  %d\n", actualSuperblockSize);
-	p = mmap(0, actualSuperblockSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);	
+	p = mmap(0, SUPERBLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);	
 	close(fd);
 
 	if (p == MAP_FAILED){
 		return 0;
 	}
-DBG_MSG("p =  0x%X\n", (unsigned int)p);
+	
 	/* Initialize the superblock structure (could be a separate function) */
-	pNewSuperblock->pPrev = 0;
-	pNewSuperblock->pNext = 0;						
-	pNewSuperblock->blockSize = blockSize;
-	pNewSuperblock->heapNum = heapNum;
-	pNewSuperblock->numBlocks = numBlocks;
-	pNewSuperblock->pBlockArray = p;
-	pNewSuperblock->numFreeBlocks = numBlocks;			
-	//pNewSuperblock->pFreeBlocksTail;
-	DBG_MSG("pNewSuperblock->pBlockArray =  0x%X\n", (unsigned int)pNewSuperblock->pBlockArray);
+	pNewSuperblock->pBlockArray = (tBlockHeader *)p;	
+	initSuperblock(pNewSuperblock, blockSize, heapNum);
+
 	DBG_EXIT;
 	return pNewSuperblock;	
+}
+
+/* Initialize the superblock for a given size class and heap */
+static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapNum)
+{
+
+	tBlockHeader	*pNewBlock;				/* first block in superblock */
+	tBlockHeader	*pEndOfSuperblock;		/* end of last block in superblock */
+	size_t			blockSizeWithHeader;	/* user memory chunk + header */
+	unsigned int	numBlocks = 0;			/* final count depends on block size */
+	
+	DBG_ENTRY;
+	pNewBlock			= (tBlockHeader*) pSuperblock -> pBlockArray;
+	pEndOfSuperblock	= pNewBlock + SUPERBLOCK_SIZE;	/* end of last block in superblock */
+	blockSizeWithHeader = blockSize + sizeof(tBlockHeader);
+	
+	DBG_MSG("1st block 0x%X end 0x%X blockSize %d blockSizeWithHeader %d\n",
+			(unsigned int)pNewBlock, (unsigned int)pEndOfSuperblock, blockSize, blockSizeWithHeader);
+			
+	/* fit in as many blocks as possible into the superblock */
+	while (pNewBlock + blockSizeWithHeader < pEndOfSuperblock)
+	{
+		/* init each block */
+		pNewBlock -> inUse = 0; 
+		pNewBlock -> size = blockSize;
+		pNewBlock -> pMySuperblock = pSuperblock;
+		/* advance to next block */
+		pNewBlock += blockSizeWithHeader;
+		numBlocks++;
+	}
+	
+	DBG_MSG("numBlocks in superblock with class size %d:  %d\n",blockSize, numBlocks);
+	
+	/* init the superblock */
+	pSuperblock->pPrev = 0;
+	pSuperblock->pNext = 0;						
+	pSuperblock->blockSize = blockSize;
+	pSuperblock->heapNum = heapNum;
+	pSuperblock->numBlocks = numBlocks;
+	pSuperblock->numFreeBlocks = numBlocks;	
+	
+	DBG_EXIT;
 }
