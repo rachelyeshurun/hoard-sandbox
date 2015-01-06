@@ -101,7 +101,7 @@ less than 75% of the total memory allocated to that heap. */
 typedef struct sBlockHeader
 {
 	unsigned int		inUse;							/* 1 if block is allocated to user, otherwise 0 */
-	unsigned int		size;							/* size of allocated memory as available for user */
+	size_t				size;							/* size of allocated memory as available for user */
 	struct sSuperblock	*pMySuperblock;					/* pointer back to superblock that contains this block */
 } tBlockHeader;
 
@@ -109,7 +109,7 @@ typedef struct sSuperblock
 {
 	struct sSuperblock	*pPrev;
 	struct sSuperblock	*pNext;							
-	unsigned int		blockSize; 						/* all blocks are same size : 2^classIndex where classIndex is 0-15 */
+	size_t				blockSize; 						/* all blocks are same size : 2^classIndex where classIndex is 0-15 */
 	unsigned int		heapNum;						/* index into the heap array to the heap this superblock belongs to */
 	unsigned int 		numBlocks; 						/* SUPERBLOCK_SIZE/blockSize */
 	tBlockHeader		*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
@@ -390,6 +390,7 @@ static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
 	if (p == MAP_FAILED){
 		return 0;
 	}
+	DBG_MSG("p 0x%X\n", (unsigned int)p);
 	
 	/* Initialize the superblock structure (could be a separate function) */
 	pNewSuperblock->pBlockArray = (tBlockHeader *)p;	
@@ -403,14 +404,14 @@ static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
 static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapNum)
 {
 
-	tBlockHeader	*pNewBlock;				/* first block in superblock */
-	tBlockHeader	*pEndOfSuperblock;		/* end of last block in superblock */
+	void			*pNewBlock;				/* first block in superblock */
+	void			*pEndOfSuperblock;		/* end of last block in superblock */
 	size_t			blockSizeWithHeader;	/* user memory chunk + header */
 	unsigned int	numBlocks = 0;			/* final count depends on block size */
 	
 	DBG_ENTRY;
-	pNewBlock			= (tBlockHeader*) pSuperblock -> pBlockArray;
-	pEndOfSuperblock	= pNewBlock + SUPERBLOCK_SIZE;	/* end of last block in superblock */
+	pNewBlock			= (void*) (pSuperblock -> pBlockArray);
+	pEndOfSuperblock	= pNewBlock + SUPERBLOCK_SIZE;
 	blockSizeWithHeader = blockSize + sizeof(tBlockHeader);
 	
 	DBG_MSG("1st block 0x%X end 0x%X blockSize %d blockSizeWithHeader %d\n",
@@ -418,11 +419,11 @@ static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapN
 			
 	/* fit in as many blocks as possible into the superblock */
 	while (pNewBlock + blockSizeWithHeader < pEndOfSuperblock)
-	{
-		/* init each block */
-		pNewBlock -> inUse = 0; 
-		pNewBlock -> size = blockSize;
-		pNewBlock -> pMySuperblock = pSuperblock;
+	{		
+		/* init each block */				
+		((tBlockHeader *)pNewBlock) -> inUse = 0U; 
+		((tBlockHeader *)pNewBlock) -> size = blockSize;
+		((tBlockHeader *)pNewBlock) -> pMySuperblock = pSuperblock;
 		/* advance to next block */
 		pNewBlock += blockSizeWithHeader;
 		numBlocks++;
