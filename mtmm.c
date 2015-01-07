@@ -102,6 +102,7 @@ typedef struct sBlockHeader
 {
 	unsigned int		inUse;							/* 1 if block is allocated to user, otherwise 0 */
 	size_t				size;							/* size of allocated memory as available for user */
+	struct sBlockHeader	*pNextFree;						/* pointer to next free block in linked list of free blocks. Only relevant if not in use. */
 	struct sSuperblock	*pMySuperblock;					/* pointer back to superblock that contains this block */
 } tBlockHeader;
 
@@ -113,7 +114,8 @@ typedef struct sSuperblock
 	unsigned int		heapNum;						/* index into the heap array to the heap this superblock belongs to */
 	unsigned int 		numBlocks; 						/* SUPERBLOCK_SIZE/blockSize */
 	tBlockHeader		*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
-	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/			
+	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/
+	tBlockHeader		*pFreeBlocksHead;				/* pointer to LIFO linked list of free blocks. */
 }tSuperblock;
 
 /* A collection of superblocks. Each superblock is divided into blocks of equal size, each equalling this class's size */
@@ -129,19 +131,18 @@ typedef struct sHeap
 	unsigned int		processorId; 					/* one heap per CPU */
 	unsigned long		statMemoryInUse;				/* The amount of memory in use by this heap */
 	unsigned long		statMemoryHeld;					/* The amount of memory held in this heap that was allocated from the operating system */
-	tSizeClass			sizeClasses[NUM_SIZE_CLASSES]; 	/* hold size classed for all sizes from 1 to log2(SUPERBLOCK_SIZE) */	
+	tSizeClass			sizeClasses[NUM_SIZE_CLASSES]; 	/* hold size classes for all sizes from 1 to log2(SUPERBLOCK_SIZE) */	
 	tSizeClass			emptySuperblocks;				/* completely empty superblocks are recycled for use by any size class */	
 } tHeap;
 
 
 typedef struct sHoard
 {
-	unsigned int		numHeaps;
 	tHeap				heapArray[NUM_HEAPS];
 }tHoard;
 
 /* Heaps are defined as a static array in the heap - reside in the data segment */
-//static tHoard		s_hoard;	
+static tHoard		s_hoard;	
 
 static void *	allocateLargeMemoryChunk(size_t	sz);
 static void		deallocateLargeMemoryChunk(void * ptr, size_t sz);
@@ -153,10 +154,28 @@ static int		getHeapNumber(unsigned int *pHeapNumber);
 static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo);
 
 /* Allocate memory (memmap) for the superblock */
-static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum);
+static tSuperblock	*	createSuperblock(size_t blockSize, unsigned int heapNum);
 
 /* Initialize the superblock for a given size class and heap */
-static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapNum);
+static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, unsigned int heapNum);
+
+/* Initialize the statically allocated hoard structures - a better implementation is dynamic alloc. for non predetermined number of heaps */
+//static void initHeaps();
+
+static void * allocMem(unsigned int heapNum, unsigned int sizeClass);
+
+/* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
+static void * allocFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass);
+
+/* create a new superblock, add to the given heap and size class, check emptiness invariant, update heap statistics, return pointer to requested block of memory */
+static void *allocFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass);
+
+/* memory to add to 'memory held' statistic in given heap. Memory to add may be negative. */
+updateMemoryHeld(unsigned int heapNum, int memoryToAdd);
+
+/* memory to add to 'memory used' statistic in given heap. Memory to add may be negative. */
+updateMemoryUsed(unsigned int heapNum, int memoryToAdd);
+
 
 /*
 
@@ -208,6 +227,7 @@ void * malloc (size_t sz)
 		return p;
 	}
 	
+	initHeaps();
 	/* hash to the correct heap */
 	if (!getHeapNumber(&heapNum))
 	{
@@ -223,11 +243,21 @@ void * malloc (size_t sz)
 		return 0;
 	}
 	DBG_MSG("sizeClassIndex =  %d\n", sizeClassIndex);
+	
+	
 	requestedBlockSize = 1 << sizeClassIndex;
 	DBG_MSG("requestedBlockSize =  %d\n", requestedBlockSize);
 	
+	if (!allocMem(heapNum, sizeClassIndex))
+	{
+		perror(NULL);
+		return 0
+	}
+	
+	/* we found free memory! */
+	
 	/* below is just placeholder... */
-	p = createSuperblock(requestedBlockSize, heapNum);
+	
 	
 	p = allocateLargeMemoryChunk(sz);
 		if (!p)
@@ -270,7 +300,6 @@ void free (void * ptr)
 		
 		if (size >= HOARD_THRESHOLD_MEM_SIZE)
 		{
-
 			deallocateLargeMemoryChunk(ptr, size);
 		}
 	}		
@@ -392,10 +421,10 @@ static tSuperblock	*	createSuperblock(size_t blockSize, int heapNum)
 	}
 	DBG_MSG("p 0x%X\n", (unsigned int)p);
 	
-	/* Initialize the superblock structure (could be a separate function) */
+	/* Initialize the superblock structure */
 	pNewSuperblock->pBlockArray = (tBlockHeader *)p;	
 	initSuperblock(pNewSuperblock, blockSize, heapNum);
-
+	
 	DBG_EXIT;
 	return pNewSuperblock;	
 }
@@ -440,4 +469,98 @@ static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapN
 	pSuperblock->numFreeBlocks = numBlocks;	
 	
 	DBG_EXIT;
+}
+
+
+static void * allocMem(int heapNum, int sizeClass)
+{
+	/* Is there a free block in this heap (in the appropriate size class) */
+	p = allocFreeBlockInHeap(heapNum, sizeClass);
+	if (p)
+	{
+		return p;
+	}
+	
+	/* So try the global heap */	
+	p = allocFreeBlockInHeap(GLOBAL_HEAP, sizeClass);
+	if (p)
+	{
+		return p;
+	}
+	/* No free chunk in global heap either. So try to allocate from a new superblock allocated from OS */ 
+	/* get a new superblock for this heap and add to appropriate size class */
+	p = allocFreeBlockInNewSuperblock(heapNum, sizeClass);
+	
+	
+	
+	/* whether we failed or succeeded return pointer  -will either be NULL or point to allocated block */
+	return p;
+	
+	
+	
+
+	
+	
+}
+
+
+
+/* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
+static void * allocFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass)
+{
+	
+}
+
+/* create a new superblock, add to the given heap and size class, check emptiness invariant, update heap statistics, return pointer to requested block of memory */
+static void *allocFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass)
+{
+	unsigned int	requestedBlockSize;
+	tSuperblock		*pNewSuperblock;
+	
+	DBG_ENTRY;
+	requestedBlockSize = 1 << sizeClassIndex;
+	pNewSuperblock = createSuperblock(requestedBlockSize, heapNum);
+	if (!pNewSuperblock)
+	{
+		DBG_EXIT;
+		return 0;
+	}
+	
+	updateMemoryInUse(heapNum, requestedBlockSize);
+	
+	/* Now attach the new superblock to the correct size class */
+	
+	/* Update the heap statistics */
+	
+	/* Check heap invariants, if necessary move superblock to global heap */
+	if (isTooEmpty(heapNum))
+	{
+		/* move superblock to global heap */
+		updateMemoryHeld(heapNum, (pNewSuperblock -> numBlocks * blockSize));
+		updateMemoryInUse(heapNum, blockSize);
+	}
+	else
+	{
+		/* Update total allocated memory in heap - take into account only mem that user can allocate */
+		updateMemoryHeld(heapNum, (pNewSuperblock -> numBlocks * blockSize));
+		updateMemoryInUse(heapNum, blockSize);
+	}
+	
+	
+	
+	
+	
+	
+}
+
+/* memory to add to 'memory held' statistic in given heap. Memory to add may be negative. */
+updateMemoryHeld(unsigned int heapNum, int memoryToAdd)
+{
+	s_hoard.heapArray[heapNum].statMemoryHeld += memoryToAdd;
+}
+
+/* memory to add to 'memory used' statistic in given heap. Memory to add may be negative. */
+updateMemoryUsed(unsigned int heapNum, int memoryToAdd)
+{
+	s_hoard.heapArray[heapNum].statMemoryInUse += memoryToAdd;
 }
