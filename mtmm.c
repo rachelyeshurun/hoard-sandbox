@@ -82,7 +82,8 @@ Note: don't forget to check return values!
 #define NUM_HEAPS			2
 #define GLOBAL_HEAP			0
 /* log2(SUPERBLOCK_SIZE) */
-#define NUM_SIZE_CLASSES	16	
+#define NUM_SIZE_CLASSES	17 /* 16 real size classes, +1 for 'any size' i.e. recycling completely empty superblocks*/	
+#define RECYCLED_CLASS		16 /* the 17th slot is for completely empty, recycled superblocks that don't yet belong to any size class */
 
 /* threshold for using hoard. If memory requested is more than this, then just mmap and return pointer to user */
 #define HOARD_THRESHOLD_MEM_SIZE	SUPERBLOCK_SIZE/2		
@@ -112,7 +113,7 @@ typedef struct sSuperblock
 	struct sSuperblock	*pNext;							
 	size_t				blockSize; 						/* all blocks are same size : 2^classIndex where classIndex is 0-15 */
 	unsigned int		heapNum;						/* index into the heap array to the heap this superblock belongs to */
-	unsigned int 		numBlocks; 						/* SUPERBLOCK_SIZE/blockSize */
+	unsigned int 		numBlocks; 						/* up to SUPERBLOCK_SIZE/blockSize. Calculated upon creation. */
 	tBlockHeader		*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
 	unsigned int		numFreeBlocks;					/* keep track of number of free blocks	*/
 	tBlockHeader		*pFreeBlocksHead;				/* pointer to LIFO linked list of free blocks. */
@@ -129,10 +130,9 @@ typedef struct sSizeClass
 typedef struct sHeap
 {
 	unsigned int		processorId; 					/* one heap per CPU */
-	unsigned long		statMemoryInUse;				/* The amount of memory in use by this heap */
-	unsigned long		statMemoryHeld;					/* The amount of memory held in this heap that was allocated from the operating system */
-	tSizeClass			sizeClasses[NUM_SIZE_CLASSES]; 	/* hold size classes for all sizes from 1 to log2(SUPERBLOCK_SIZE) */	
-	tSizeClass			emptySuperblocks;				/* completely empty superblocks are recycled for use by any size class */	
+	size_t				statMemoryInUse;				/* The amount of memory in use by this heap */
+	size_t				statMemoryHeld;					/* The amount of memory held in this heap that was allocated from the operating system */
+	tSizeClass			sizeClasses[NUM_SIZE_CLASSES]; 	/* hold size classes for all sizes from 1 to log2(SUPERBLOCK_SIZE) plus one for completely empty s.blocks */	
 } tHeap;
 
 
@@ -165,16 +165,32 @@ static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, unsigned 
 static void * allocMem(unsigned int heapNum, unsigned int sizeClass);
 
 /* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
-static void * allocFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass);
+static void * allocFromFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass);
 
 /* create a new superblock, add to the given heap and size class, check emptiness invariant, update heap statistics, return pointer to requested block of memory */
-static void *allocFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass);
+static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass);
 
 /* memory to add to 'memory held' statistic in given heap. Memory to add may be negative. */
-updateMemoryHeld(unsigned int heapNum, int memoryToAdd);
+static void updateMemoryHeld(unsigned int heapNum, int memoryToAdd);
 
 /* memory to add to 'memory used' statistic in given heap. Memory to add may be negative. */
-updateMemoryUsed(unsigned int heapNum, int memoryToAdd);
+static void updateMemoryUsed(unsigned int heapNum, int memoryToAdd);
+
+/* return 1 if heap is under the fullness threshold, otherwise if heap is still full enough, return 0 */
+static int isEmptyEnough(unsigned int heapNum);
+
+/* return 1 if heap is under the fullness threshold, otherwise if heap is still full enough, return 0 */
+static tSuperblock *findEmptyEnoughSuperblock(unsigned int heapNum);
+
+/* move superblock from one heap to the other, update statistics ...*/
+static void moveSuperblockFromTo(unsigned int fromHeap, unsigned int toHeap, tSuperblock *pSuperblock);
+
+/* add superblock to the sorted-from-fullest-to-emptiest list of superblocks for the given size class and heap */
+static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock);
+
+/* remove superblock from the sorted-from-fullest-to-emptiest list of superblocks for the given size class and heap */
+static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock);
+
 
 
 /*
@@ -475,44 +491,37 @@ static void initSuperblock(tSuperblock *pSuperblock, size_t blockSize, int heapN
 static void * allocMem(int heapNum, int sizeClass)
 {
 	/* Is there a free block in this heap (in the appropriate size class) */
-	p = allocFreeBlockInHeap(heapNum, sizeClass);
+	p = allocFromFreeBlockInHeap(heapNum, sizeClass);
 	if (p)
 	{
 		return p;
 	}
 	
 	/* So try the global heap */	
-	p = allocFreeBlockInHeap(GLOBAL_HEAP, sizeClass);
+	p = allocFromFreeBlockInHeap(GLOBAL_HEAP, sizeClass);
 	if (p)
 	{
 		return p;
 	}
 	/* No free chunk in global heap either. So try to allocate from a new superblock allocated from OS */ 
 	/* get a new superblock for this heap and add to appropriate size class */
-	p = allocFreeBlockInNewSuperblock(heapNum, sizeClass);
-	
-	
-	
+	p = allocFromFreeBlockInNewSuperblock(heapNum, sizeClass);
+		
 	/* whether we failed or succeeded return pointer  -will either be NULL or point to allocated block */
-	return p;
-	
-	
-	
-
-	
+	return p;	
 	
 }
 
 
 
 /* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
-static void * allocFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass)
+static void * allocFromFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass)
 {
 	
 }
 
 /* create a new superblock, add to the given heap and size class, check emptiness invariant, update heap statistics, return pointer to requested block of memory */
-static void *allocFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass)
+static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass)
 {
 	unsigned int	requestedBlockSize;
 	tSuperblock		*pNewSuperblock;
@@ -533,34 +542,161 @@ static void *allocFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int si
 	/* Update the heap statistics */
 	
 	/* Check heap invariants, if necessary move superblock to global heap */
+	updateMemoryHeld(heapNum, (pNewSuperblock -> numBlocks * blockSize));
+	updateMemoryInUse(heapNum, blockSize);
+	
 	if (isTooEmpty(heapNum))
 	{
 		/* move superblock to global heap */
-		updateMemoryHeld(heapNum, (pNewSuperblock -> numBlocks * blockSize));
-		updateMemoryInUse(heapNum, blockSize);
+		moveSuperblockFromTo(heapNum, GLOBAL_HEAP);
+		/* update statistics */
+		updateMemoryHeld(GLOBAL_HEAP, (pNewSuperblock -> numBlocks * blockSize));
+		updateMemoryInUse(GLOBAL_HEAP, blockSize);
+		updateMemoryHeld(heapNum, (-1)*(pNewSuperblock -> numBlocks * blockSize));
+		updateMemoryInUse(heapNum, (-1)*blockSize);
 	}
-	else
-	{
-		/* Update total allocated memory in heap - take into account only mem that user can allocate */
-		updateMemoryHeld(heapNum, (pNewSuperblock -> numBlocks * blockSize));
-		updateMemoryInUse(heapNum, blockSize);
-	}
-	
-	
-	
-	
-	
+		
 	
 }
 
 /* memory to add to 'memory held' statistic in given heap. Memory to add may be negative. */
-updateMemoryHeld(unsigned int heapNum, int memoryToAdd)
+static void updateMemoryHeld(unsigned int heapNum, int memoryToAdd)
 {
 	s_hoard.heapArray[heapNum].statMemoryHeld += memoryToAdd;
 }
 
 /* memory to add to 'memory used' statistic in given heap. Memory to add may be negative. */
-updateMemoryUsed(unsigned int heapNum, int memoryToAdd)
+static void updateMemoryUsed(unsigned int heapNum, int memoryToAdd)
 {
 	s_hoard.heapArray[heapNum].statMemoryInUse += memoryToAdd;
 }
+
+
+/* return 1 if heap is under the fullness threshold, otherwise if heap is still full enough, return 0 */
+static int isEmptyEnough(unsigned int heapNum)
+{
+	size_t	memHeld, memInUse;
+	
+	memHeld = s_hoard.heapArray[heapNum].statMemoryHeld;
+	memInUse = s_hoard.heapArray[heapNum].statMemoryInUse;
+	
+	if (memInUse >= memHeld - (SUPERBLOCK_EMPTY_THRESHHOLD_K * SUPERBLOCK_SIZE))
+	{
+		return 0;
+	}
+	
+	if (memInUse >= (1 - FULLNESS_THRESHOLD_F) * memHeld)
+	{
+		return 0;
+	}
+	/* The emptiness invariant holds */
+	
+	return 1;
+}
+
+/* return the superblock that is empty enough to be moved to the global heap */
+static tSuperblock *findEmptyEnoughSuperblock(unsigned int heapNum)
+{
+	int				sizeClassIdx;
+	tSizeClass		*pSizeClass;
+	tHeap			*pHeap;
+	tSuperblock		*pSuperblock;
+	
+	DBG_ENTRY;
+	/* search through this heap's size classes for a superblock that maintains the emptiness invariant 
+	'at least f empty' */
+	pHeap = &s_hoard.heapArray[heapNum];
+	
+	for (sizeClassIdx = 0; sizeClassIdx < NUM_SIZE_CLASSES; sizeClassIdx++)
+	{
+		pSizeClass = &pHeap->sizeClasses[sizeClassIdx];
+		/* just check the tail since the list is ordered from full to least full */
+		pSuperblock = &pSizeClass->pTail;
+		if ((pSuperblock->numFreeBlocks/pSuperblock->numBlocks) > FULLNESS_THRESHOLD_F)
+		{
+			DBG_EXIT;
+			return pSuperblock;
+		}
+	}
+	DBG_EXIT;
+	return 0;	
+}
+
+/* move superblock from one heap to the other, update statistics ...*/
+static void moveSuperblockFromTo(unsigned int fromHeap, unsigned int toHeap, tSuperblock *pSuperblock)
+{
+	
+}
+
+/* add superblock to the sorted-from-fullest-to-emptiest list of superblocks for the given size class and heap */
+static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock)
+{
+	float			emptyFactor, tempEmptyFactor;
+	tSuperblock		*pPrevSb;
+	tSuperblock		*pTempSb;
+	tSizeClass		*pSizeClass;
+	DBG_ENTRY;
+	
+	pSizeClass = &s_hoard.heapArray[heapNum].sizeClasses[sizeClass];
+	emptyFactor = (pSuperblock->numFreeBlocks/pSuperblock->numBlocks);
+	/* make sure the superblock to be attached isn't still chained to its previous size class linked list */
+	pSuperblock->pNext = NULL;
+	pSuperblock->pPrev = NULL;	
+	
+	/* we'll start the search from the tail because usually we're adding empty superblocks. This algo. can be improved */
+	pTempSb = pSizeClass->pTail;
+	if (!pTempSb)
+	{
+		/* this is the first superblock in the chain */
+		pSizeClass->pHead = pSizeClass->pTail = pSuperblock;	
+		DBG_EXIT;
+		return;
+	}
+	
+	/* not the first - need to find its place in the order */
+	tempEmptyFactor = pTempSb->numFreeBlocks/pTempSb->numBlocks;
+	while (pTempSb && emptyFactor < tempEmptyFactor)
+	{
+		pTempSb = pTempSb->pPrev;
+		tempEmptyFactor = pTempSb->numFreeBlocks/pTempSb->numBlocks;
+	}
+	
+	if (pTempSb)
+	{
+		/* not inserting at top, so attach to previous */
+		pSuperblock->pNext = pTempSb->pNext;
+	}
+	else
+	{
+		/* inserting at top */
+		pSuperblock->pNext = pSizeClass->pHead;
+		pSizeClass->pHead->pPrev = pSuperblock;
+		pSizeClass->pHead = pSuperblock;
+		DBG_EXIT;
+		return;
+	}
+	
+	if(pTempSb->pNext)
+	{
+		/* we're not inserting at end */
+		pTempSb->pNext->pPrev = pSuperblock;
+	}
+	else
+	{
+		/* We are inserting at end */
+		pSizeClass->pTail = pSuperblock;
+	}
+	
+	pTempSb->pNext = pSuperblock;
+	pSuperblock->pPrev = pTempSb;
+	
+	DBG_EXIT;
+}
+
+/* remove superblock from the sorted-from-fullest-to-emptiest list of superblocks for the given size class and heap */
+static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock)
+{
+	
+}
+
+
