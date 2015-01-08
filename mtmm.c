@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "mtmm.h"
 
@@ -21,7 +22,7 @@
 #endif
 
   
-#define NUM_HEAPS			2
+#define NUM_HEAPS			3
 #define GLOBAL_HEAP			0
 /* log2(SUPERBLOCK_SIZE) */
 #define NUM_SIZE_CLASSES	17 /* 16 real size classes, +1 for 'any size' i.e. recycling completely empty superblocks*/	
@@ -87,6 +88,9 @@ typedef struct sHoard
 /* Heaps are defined as a static array in the heap - reside in the data segment */
 static tHoard		s_hoard;	
 
+/* Function to print out contents of hoard heaps */
+static void dumpHoard(char *title);
+
 /* Allocate memory straight from OS  */
 static void *	allocateLargeMemoryChunk(size_t	sz);
 
@@ -97,7 +101,7 @@ static void		deallocateLargeMemoryChunk(void * ptr, size_t sz);
 static int		getHeapNumber(unsigned int *pHeapNumber);
 
 /* Get size class by rounding up requested size to next highest power of 2, return that power. */
-static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo);
+static int		getSizeClass    (size_t	requestedSize, unsigned int *pNextPowerOfTwo);
 
 /* Allocate memory (memmap) for the superblock */
 static tSuperblock	*	createSuperblock(unsigned int heapNum, unsigned int sizeClass);
@@ -136,7 +140,7 @@ static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, t
 static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock);
 
 /* allocate one block of memory from the given superblock */
-void * allocBlock(tSuperblock *pSuperblock);
+void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass);
 
 /* Recycle completely empty superblocks to be used by any size class */
 static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsigned int newSizeClass);
@@ -170,14 +174,14 @@ malloc (sz)
 
 void * malloc (size_t sz)
 {	
-	void			*p;
+	void			*p = 0;
 	unsigned int 	heapNum = GLOBAL_HEAP;
-	unsigned int	requestedBlockSize = 0;
-	int				sizeClassIndex;
+	unsigned int	sizeClassIndex = 0U;
+		
+	//DBG_MSG("requested size: %d\n", sz);
+	printf("malloc requested size: %d\n", sz);
 	
-	DBG_EXIT;
-	
-	DBG_MSG("requested size: %d\n", sz);
+	dumpHoard("begin malloc");
 
 	if (sz >= HOARD_THRESHOLD_MEM_SIZE)
 	{
@@ -206,29 +210,16 @@ void * malloc (size_t sz)
 	}
 	DBG_MSG("sizeClassIndex =  %d\n", sizeClassIndex);
 	
-	
-	requestedBlockSize = 1 << sizeClassIndex;
-	DBG_MSG("requestedBlockSize =  %d\n", requestedBlockSize);
-	
-	if (!allocMem(heapNum, sizeClassIndex))
+	p = allocMem(heapNum, sizeClassIndex);
+	DBG_MSG("after allocMem p=0x%x\n", (unsigned int)p);
+	if (!p)
 	{
-		perror(NULL);
 		return 0;
 	}
 	
 	/* we found free memory! */
-	
-	/* below is just placeholder... */
-	
-	
-	p = allocateLargeMemoryChunk(sz);
-		if (!p)
-		{
-			perror(NULL);
-			return 0;
-		}
+	printf("malloc returns p=0x%x\n", (unsigned int)p);
 	return p;
-	DBG_EXIT;
 }
 
 /*
@@ -334,12 +325,12 @@ static int		getHeapNumber(unsigned int *pHeapNumber)
 	DBG_MSG("self =  0x%.8x\n", (unsigned)self);
 	
 	/* trying to reduce the probability that two threads will use the same heap */
-	*pHeapNumber = ((self >> 12) % NUM_HEAPS) + 1;
+	*pHeapNumber = ((self >> 12) % (NUM_HEAPS-1)) + 1;
 	return 1;	
 }
 
 /* Get size class by rounding up requested size to next highest power of 2, return that power. */
-static int		getSizeClass    (size_t	requestedSize, int *pNextPowerOfTwo)
+static int		getSizeClass    (size_t	requestedSize, unsigned int *pNextPowerOfTwo)
 {
 	int		count = 0;
 	int		dividedByTwo = requestedSize -1; /*subtracting 1 so that if the requested size is exact power, we won't round up */
@@ -437,6 +428,7 @@ static void initSuperblock(unsigned int heapNum, unsigned int sizeClass, tSuperb
 	pSuperblock->ownerHeap = heapNum;
 	pSuperblock->numBlocks = numBlocks;
 	pSuperblock->numFreeBlocks = numBlocks;	
+	pSuperblock->pFreeBlocksHead = pSuperblock->pBlockArray;
 	
 	/* now update how much memory is held. Note that this is not the real amount of memory - but
 	rather the amount of memory held that will be taken in to account when calculating how 'empty' a superblock is */
@@ -449,11 +441,20 @@ static void initSuperblock(unsigned int heapNum, unsigned int sizeClass, tSuperb
 static void * allocMem(unsigned int heapNum, unsigned int sizeClass)
 {
 	void *p;
-	
+	DBG_ENTRY;
 	/* Is there a free block in this heap (in the appropriate size class) */
 	p = allocFromFreeBlockInHeap(heapNum, sizeClass);
 	if (p)
 	{
+		DBG_EXIT;
+		return p;
+	}
+	
+	/* So check to see if we can use a recycled superblock */
+	p = allocFromFreeBlockInHeap(heapNum, RECYCLED_CLASS);
+	if (p)
+	{
+		DBG_EXIT;
 		return p;
 	}
 	
@@ -461,6 +462,7 @@ static void * allocMem(unsigned int heapNum, unsigned int sizeClass)
 	p = allocFromFreeBlockInHeap(GLOBAL_HEAP, sizeClass);
 	if (p)
 	{
+		DBG_EXIT;
 		return p;
 	}
 	/* No free chunk in global heap either. So try to allocate from a new superblock allocated from OS */ 
@@ -468,24 +470,47 @@ static void * allocMem(unsigned int heapNum, unsigned int sizeClass)
 	p = allocFromFreeBlockInNewSuperblock(heapNum, sizeClass);
 		
 	/* whether we failed or succeeded, return pointer - will either be NULL or point to allocated block */
-	return p;	
+	DBG_EXIT;
+	return p;
 	
 }
-
 
 
 /* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
 static void * allocFromFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass)
 {
-	/*placeholder for compilation only! TODO.. */
-	return (void *)&s_hoard;
+	tSizeClass		*pSizeClass;
+	tSuperblock		*pSuperblock;
+	void			*p;
+	
+	DBG_ENTRY;
+	/* Check each superblock of this heap and size class and see if it has any free memory */
+	pSizeClass = &s_hoard.heapArray[heapNum].sizeClasses[sizeClass];
+	/* start searching from the most full */
+	pSuperblock = pSizeClass->pHead;
+	
+	while (pSuperblock)
+	{
+		p = allocBlock(pSuperblock, sizeClass);
+		if (p)
+		{
+			/* found a free block! */
+			DBG_EXIT;
+			return p;
+		}
+		pSuperblock = pSuperblock->pNext;
+	}
+			
+	/* No free memory found in this class */
+	DBG_EXIT;
+	return 0;
 }
 
 /* create a new superblock, add to the given heap and size class, check emptiness invariant, update heap statistics, return pointer to requested block of memory */
 static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass)
 {
 	tSuperblock		*pNewSuperblock;
-	tSuperblock		*pEmptyEnougSuperblock;
+	tSuperblock		*pEmptyEnoughSuperblock;
 	void			*p;
 		
 	DBG_ENTRY;
@@ -497,7 +522,7 @@ static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned in
 		return 0;
 	}
 		
-	p = allocBlock(pNewSuperblock);
+	p = allocBlock(pNewSuperblock, sizeClass);
 	
 	if (!p)
 	{
@@ -505,18 +530,20 @@ static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned in
 		DBG_EXIT;
 		return 0;
 	}
-			
+	//dumpHoard("before addSuperblockToClass");		
 	/* Now attach the new superblock to the correct size class */
 	addSuperblockToClass(heapNum, sizeClass, pNewSuperblock);
-	
+	//dumpHoard("after addSuperblockToClass");
 	/* Check heap invariants, if necessary move superblock to global heap */
 		
-	pEmptyEnougSuperblock = findEmptyEnoughSuperblock(heapNum);
-	while (pEmptyEnougSuperblock  && isEmptyEnough(heapNum))
+	pEmptyEnoughSuperblock = findEmptyEnoughSuperblock(heapNum);
+	DBG_MSG("pEmptyEnoughSuperblock=0x%x\n", (unsigned int)pEmptyEnoughSuperblock);
+	
+	while (pEmptyEnoughSuperblock  && isEmptyEnough(heapNum))
 	{
 		/* move superblock to global heap */
 		moveSuperblockFromTo(heapNum, GLOBAL_HEAP, pNewSuperblock);
-		pEmptyEnougSuperblock = findEmptyEnoughSuperblock(heapNum);		
+		pEmptyEnoughSuperblock = findEmptyEnoughSuperblock(heapNum);		
 	}
 		
 	DBG_EXIT;
@@ -569,7 +596,7 @@ static tSuperblock *findEmptyEnoughSuperblock(unsigned int heapNum)
 	
 	DBG_ENTRY;
 	/* search through this heap's size classes for a superblock that maintains the emptiness invariant 
-	'at least f empty' */
+	'at least f empty'  - this is using a slow algorithm .. another point that can be optimized */
 	pHeap = &s_hoard.heapArray[heapNum];
 	
 	for (sizeClassIdx = 0; sizeClassIdx < NUM_SIZE_CLASSES; sizeClassIdx++)
@@ -577,7 +604,8 @@ static tSuperblock *findEmptyEnoughSuperblock(unsigned int heapNum)
 		pSizeClass = &pHeap->sizeClasses[sizeClassIdx];
 		/* just check the tail since the list is ordered from full to least full */
 		pSuperblock = pSizeClass->pTail;
-		if ((pSuperblock->numFreeBlocks/pSuperblock->numBlocks) > FULLNESS_THRESHOLD_F)
+		DBG_MSG("sizeClassIdx=%d pSuperblock=0x%x\n",sizeClassIdx, (unsigned int)pSuperblock);
+		if (pSuperblock && ((pSuperblock->numFreeBlocks/pSuperblock->numBlocks) > FULLNESS_THRESHOLD_F))
 		{
 			DBG_EXIT;
 			return pSuperblock;
@@ -624,6 +652,7 @@ static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, t
 	tSizeClass		*pSizeClass;
 	DBG_ENTRY;
 	
+	DBG_MSG("heap %d size %d pSuperblock=0x%x\n", heapNum, sizeClass, (unsigned int)pSuperblock);
 	pSizeClass = &s_hoard.heapArray[heapNum].sizeClasses[sizeClass];
 	emptyFactor = (pSuperblock->numFreeBlocks/pSuperblock->numBlocks);
 	/* make sure the superblock to be attached isn't still chained to its previous size class linked list */
@@ -632,10 +661,13 @@ static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, t
 	
 	/* we'll start the search from the tail because usually we're adding empty superblocks. This algo. can be improved */
 	pTempSb = pSizeClass->pTail;
+	DBG_MSG("start search from tail=0x%x\n",(unsigned int)pSizeClass->pTail);
+		
 	if (!pTempSb)
 	{
 		/* this is the first superblock in the chain */
-		pSizeClass->pHead = pSizeClass->pTail = pSuperblock;	
+		pSizeClass->pHead = pSizeClass->pTail = pSuperblock;
+		DBG_MSG("first superblock in chain head=0x%x tail=0x%x\n", (unsigned int)pSizeClass->pHead, (unsigned int)pSizeClass->pTail);
 		DBG_EXIT;
 		return;
 	}
@@ -714,7 +746,7 @@ static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeCla
 }
 
 /* allocate one block of memory from the given superblock */
-void * allocBlock(tSuperblock *pSuperblock)
+void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass)
 {
 	tBlockHeader		*pBlock;
 	void				*p = 0;
@@ -726,6 +758,11 @@ void * allocBlock(tSuperblock *pSuperblock)
 	{
 		DBG_EXIT;
 		return 0;
+	}
+	
+	if (RECYCLED_CLASS == pSuperblock->sizeClass)
+	{
+		recycleSuperblock(pSuperblock, pSuperblock->ownerHeap, requestedSizeClass);
 	}
 	
 	/* user memory block has a header right before it. This is the 'trick' for finding block info on free*/
@@ -748,7 +785,7 @@ static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, un
 {	
 	DBG_ENTRY;
 	
-	if (newSizeClass == RECYCLED_CLASS)
+	if (RECYCLED_CLASS == newSizeClass)
 	{
 		/* just move superblock as is to the 'all empty' class.*/
 		removeSuperblockFromClass(heapNum, pSuperblock->sizeClass, pSuperblock);
@@ -767,4 +804,42 @@ static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, un
 	initSuperblock(heapNum, newSizeClass, pSuperblock);
 		
 	DBG_EXIT;
+}
+
+
+static void dumpHoard(char *title)
+{
+	int				heap, class;
+	tHeap			*pHeap;
+	tSizeClass		*pClass;
+	tSuperblock		*pSb;
+	
+	printf("-----------------------------------------------------------------\n");
+	printf("\nDUMP HOARD:");
+	
+	if (title) {printf("%s\n", title);} else {printf("\n");}
+	
+	for (heap = 0; heap < NUM_HEAPS; heap++)
+	{
+		pHeap = &s_hoard.heapArray[heap];
+		printf("-----------------------------------------------------------------\n");
+		printf("heap #%d: procId=%d inUse=%d held=%d\n",heap, pHeap->processorId, pHeap->statMemoryInUse, pHeap->statMemoryHeld);
+		printf("-----------------------------------------------------------------\n");
+		for (class = 0; class < NUM_SIZE_CLASSES; class++)
+		{
+			pClass = &pHeap->sizeClasses[class];
+			printf("class #%d: size=%d head=0x%x tail=0x%x\n",
+						class, pClass->size, (unsigned int)pClass->pHead, (unsigned int)pClass->pTail);
+			pSb = pClass->pHead;
+			while (pSb)
+			{
+				printf("Superblock: pNext=0x%x sizeClass=%d blockSize=%d ownerHeap=%d numBlocks=%d numFreeBlocks=%d pBlockArray=0x%x pFreeBlocksHead=0x%x\n",
+						(unsigned int)pSb->pNext, pSb->sizeClass,
+						pSb->blockSize, pSb->ownerHeap, pSb->numBlocks,
+						pSb->numFreeBlocks, (unsigned int)pSb->pBlockArray, (unsigned int)pSb->pFreeBlocksHead);
+				pSb = pSb->pNext;				
+			}						
+		}	
+	}
+	printf("--------------------END HOARD DUMP ------------------------------------\n");
 }
