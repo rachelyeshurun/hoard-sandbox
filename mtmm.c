@@ -288,6 +288,7 @@ void free (void * ptr)
 		recycleSuperblock(heapNum, RECYCLED_CLASS, pMySuperblock);
 	}
 	
+	updateMemoryUsed(heapNum, (-1)*pMySuperblock->blockSize);
 	/* Check heap invariants, if necessary move superblock to global heap */		
 	checkInvariantAndMoveSuperblocks(heapNum);	
 }
@@ -531,6 +532,11 @@ static void * allocFromFreeBlockInHeap(unsigned int heapNum, unsigned int sizeCl
 		if (p)
 		{
 			/* found a free block! */
+			updateMemoryUsed(pSuperblock->ownerHeap, pSuperblock->blockSize);
+	
+			/* This block's superblock might need to change its place in the ordered list */
+			reorderSuperblockInClass(pSuperblock->ownerHeap, sizeClass, pSuperblock);
+			
 			DBG_EXIT;
 			return p;
 		}
@@ -566,6 +572,8 @@ static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned in
 		return 0;
 	}
 
+	updateMemoryUsed(heapNum, pNewSuperblock->blockSize);
+	
 	/* Now attach the new superblock to the correct size class */
 	addSuperblockToClass(heapNum, sizeClass, pNewSuperblock);
 
@@ -804,13 +812,9 @@ void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass)
 	pSuperblock->pFreeBlocksHead = pBlock->pNextFree;
 	pBlock->pNextFree = NULL;
 	
-	/* update flags and statistics */
+	/* update flags and free block counter*/
 	pBlock->inUse = 1;	
 	pSuperblock->numFreeBlocks--;
-	updateMemoryUsed(pSuperblock->ownerHeap, pSuperblock->blockSize);
-	
-	/* This block's superblock might need to change its place in the ordered list */
-	reorderSuperblockInClass(pSuperblock->ownerHeap, requestedSizeClass, pSuperblock);
 	
 	DBG_EXIT;
 	return p;
