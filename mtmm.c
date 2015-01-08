@@ -54,6 +54,7 @@ typedef struct sSuperblock
 	struct sSuperblock	*pPrev;
 	struct sSuperblock	*pNext;							
 	unsigned int		sizeClass; 						/* 0-16 - size class 16 is the recycled class - can be any size */
+	size_t				blockSize;						/* calculate only once on initialization */
 	unsigned int		ownerHeap;						/* index into the heap array to the heap this superblock belongs to */
 	unsigned int 		numBlocks; 						/* up to SUPERBLOCK_SIZE/blockSize. Calculated upon creation. */
 	tBlockHeader		*pBlockArray;					/* mmap space needed according to num blocks - depends on class size */
@@ -86,7 +87,10 @@ typedef struct sHoard
 /* Heaps are defined as a static array in the heap - reside in the data segment */
 static tHoard		s_hoard;	
 
+/* Allocate memory straight from OS  */
 static void *	allocateLargeMemoryChunk(size_t	sz);
+
+/* Deallocate memory that was previously allocated from OS  */
 static void		deallocateLargeMemoryChunk(void * ptr, size_t sz);
 
 /* Gets an index into the heap array based on the current thread's processor id */
@@ -100,7 +104,8 @@ static tSuperblock	*	createSuperblock(unsigned int heapNum, unsigned int sizeCla
 
 /* Initialize the superblock for a given size class and heap */
 static void initSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsigned int sizeClass);
-    
+ 
+/* internal malloc function */ 
 static void * allocMem(unsigned int heapNum, unsigned int sizeClass);
 
 /* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
@@ -130,8 +135,11 @@ static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, t
 /* remove superblock from the sorted-from-fullest-to-emptiest list of superblocks for the given size class and heap */
 static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock);
 
+/* allocate one block of memory from the given superblock */
+void * allocBlock(tSuperblock *pSuperblock);
 
-
+/* Recycle completely empty superblocks to be used by any size class */
+static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsigned int newSizeClass);
 /*
 
 The malloc() function allocates size bytes and returns a pointer to the allocated memory. 
@@ -205,7 +213,7 @@ void * malloc (size_t sz)
 	if (!allocMem(heapNum, sizeClassIndex))
 	{
 		perror(NULL);
-		return 0
+		return 0;
 	}
 	
 	/* we found free memory! */
@@ -425,16 +433,23 @@ static void initSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsig
 	pSuperblock->pPrev = 0;
 	pSuperblock->pNext = 0;						
 	pSuperblock->sizeClass = sizeClass;
+	pSuperblock->blockSize = blockSize;
 	pSuperblock->ownerHeap = heapNum;
 	pSuperblock->numBlocks = numBlocks;
 	pSuperblock->numFreeBlocks = numBlocks;	
 	
+	/* now update how much memory is held. Note that this is not the real amount of memory - but
+	rather the amount of memory held that will be taken in to account when calculating how 'empty' a superblock is */
+	updateMemoryHeld(heapNum, (pNewSuperblock->numBlocks * pNewSuperblock->blockSize));
+	
 	DBG_EXIT;
 }
 
-
-static void * allocMem(int heapNum, int sizeClass)
+/* internal malloc function */
+static void * allocMem(unsigned int heapNum, unsigned int sizeClass)
 {
+	void *p;
+	
 	/* Is there a free block in this heap (in the appropriate size class) */
 	p = allocFromFreeBlockInHeap(heapNum, sizeClass);
 	if (p)
@@ -462,7 +477,8 @@ static void * allocMem(int heapNum, int sizeClass)
 /* search for free block in given size class, return pointer to block if found, otherwise NULL. Update heap statistics */
 static void * allocFromFreeBlockInHeap(unsigned int heapNum, unsigned int sizeClass)
 {
-	
+	/*placeholder for compilation only! TODO.. */
+	return (void *)&s_hoard;
 }
 
 /* create a new superblock, add to the given heap and size class, check emptiness invariant, update heap statistics, return pointer to requested block of memory */
@@ -470,7 +486,8 @@ static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned in
 {
 	unsigned int	requestedBlockSize;
 	tSuperblock		*pNewSuperblock;
-	
+	void			*p;
+		
 	DBG_ENTRY;
 	
 	pNewSuperblock = createSuperblock(heapNum, sizeClass);
@@ -479,26 +496,30 @@ static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned in
 		DBG_EXIT;
 		return 0;
 	}
+		
+	p = allocBlock(pNewSuperblock);
 	
-	updateMemoryInUse(heapNum, requestedBlockSize);
+	if (!p)
+	{
+		/* shouldn't get to this, since it's a brand new empty superblock ... maybe should assert?*/
+		return 0;
+	}
+		
+	addSuperblockToClass(heapNum, sizeClass, pNewSuperblock);
+
 	
 	/* Now attach the new superblock to the correct size class */
 	
 	/* Update the heap statistics */
 	
 	/* Check heap invariants, if necessary move superblock to global heap */
-	updateMemoryHeld(heapNum, (pNewSuperblock -> numBlocks * blockSize));
+	
 	updateMemoryInUse(heapNum, blockSize);
 	
 	if (isTooEmpty(heapNum))
 	{
 		/* move superblock to global heap */
-		moveSuperblockFromTo(heapNum, GLOBAL_HEAP);
-		/* update statistics */
-		updateMemoryHeld(GLOBAL_HEAP, (pNewSuperblock -> numBlocks * blockSize));
-		updateMemoryInUse(GLOBAL_HEAP, blockSize);
-		updateMemoryHeld(heapNum, (-1)*(pNewSuperblock -> numBlocks * blockSize));
-		updateMemoryInUse(heapNum, (-1)*blockSize);
+		moveSuperblockFromTo(heapNum, GLOBAL_HEAP, pNewSuperblock);
 	}
 		
 	
@@ -695,4 +716,65 @@ static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeCla
 	DBG_EXIT;
 }
 
+/* allocate one block of memory from the given superblock */
+void * allocBlock(tSuperblock *pSuperblock)
+{
+	tBlockHeader		*pBlock;
+	void				*p = 0;
+	
+	DBG_ENTRY;
+	pBlock = pSuperblock->pFreeBlocksHead;
+	
+	if (!pBlock)
+	{
+		DBG_EXIT;
+		return 0;
+	}
+	
+	/* user memory block has a header right before it. This is the 'trick' for finding block info on free*/
+	p = ((void *)pBlock) + sizeof(tBlockHeader);
+	
+	/* unlink block from head of free chain */
+	pSuperblock->pFreeBlocksHead = pBlock->pNextFree;
+	pBlock->pNextFree = NULL;
+	
+	/* update flags and statistics */
+	pBlock->inUse = 1;	
+	pSuperblock->numFreeBlocks--;
+	updateMemoryInUse(pSuperblock->ownerHeap, pSuperblock->blockSize);
+	
+	DBG_EXIT;
+	return p;
+}
 
+static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsigned int newSizeClass)
+{
+
+	void			*pNewBlock;						/* first block in superblock */
+	void			*pEndOfSuperblock;				/* end of last block in superblock */
+	size_t			blockSize, blockSizeWithHeader;	/* user memory chunk + header */
+	unsigned int	numBlocks = 0;					/* final count depends on block size */
+	unsigned int	numOf
+	
+	DBG_ENTRY;
+	
+	if (newSizeClass == RECYCLED_CLASS)
+	{
+		/* just move superblock as is to the 'all empty' class.*/
+		removeSuperblockFromClass(heapNum, pSuperblock->sizeClass, pSuperblock);
+		pSuperblock->sizeClass = RECYCLED_CLASS;
+		addSuperblockToClass(heapNum, RECYCLED_CLASS, pNewSuperblock);
+		/* not updating heap statistics. Superblock will carry old numBlocks and blockSize until recycled into new size class */
+		return;
+	}
+	
+	/* We are recycling into a new size class. Need to be careful here with the statistics, because the memory
+		held by superblock depended on the previous size class, and on how many blocks we managed to fit
+		in to this superblock while taking the block header size into consideration.. */
+	updateMemoryHeld(heapNum, (-1)*(pSuperblock->numBlocks * pSuperblock->blockSize));
+	
+	/* Now overwrite numBlocks, blockSize and heap stats */
+	initSuperblock(pSuperblock, heapNum, newSizeClass);
+		
+	DBG_EXIT;
+}
