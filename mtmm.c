@@ -139,13 +139,19 @@ static void addSuperblockToClass(unsigned int heapNum, unsigned int sizeClass, t
 /* remove superblock from the sorted-from-fullest-to-emptiest list of superblocks for the given size class and heap */
 static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock);
 
+/* Keep sorted-from-fullest-to-emptiest list of superblocks sorted upon malloc or free */
+static void reorderSuperblockInClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock);
+
 /* allocate one block of memory from the given superblock */
 void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass);
 
 /* Recycle completely empty superblocks to be used by any size class */
-static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsigned int newSizeClass);
-/*
+static void recycleSuperblock(unsigned int heapNum, unsigned int newSizeClass, tSuperblock *pSuperblock);
 
+/* check if the heap is too empty and move f-empty superblocks out to global heap */
+static void checkInvariantAndMoveSuperblocks(unsigned int heapNum);
+
+/*
 The malloc() function allocates size bytes and returns a pointer to the allocated memory. 
 The memory is not initialized. If size is 0, then malloc() returns either NULL, or a unique 
 pointer value that can later be successfully passed to free(). 
@@ -188,7 +194,6 @@ void * malloc (size_t sz)
 		p = allocateLargeMemoryChunk(sz);
 		if (!p)
 		{
-			perror(NULL);
 			return 0;
 		}
 		return p;
@@ -197,7 +202,6 @@ void * malloc (size_t sz)
 	/* hash to the correct heap */
 	if (!getHeapNumber(&heapNum))
 	{
-		perror(NULL);
 		return 0;
 	}
 	
@@ -205,7 +209,6 @@ void * malloc (size_t sz)
 	
 	if (!getSizeClass (sz, &sizeClassIndex))
 	{
-		perror(NULL);
 		return 0;
 	}
 	DBG_MSG("sizeClassIndex =  %d\n", sizeClassIndex);
@@ -247,15 +250,46 @@ to heap 0 (the global heap).
 */
 void free (void * ptr) 
 {  
-	if (ptr != NULL)
-    	{
-		size_t size = ((tBlockHeader *)(ptr - sizeof(tBlockHeader))) -> size + sizeof(tBlockHeader);
-		
-		if (size >= HOARD_THRESHOLD_MEM_SIZE)
-		{
-			deallocateLargeMemoryChunk(ptr, size);
-		}
-	}		
+	tBlockHeader	*pBlockHeader;
+	tSuperblock		*pMySuperblock;
+	size_t			size;
+	unsigned int	heapNum;
+	
+	if (!ptr)
+	{
+		return;
+	}
+	
+	pBlockHeader = (tBlockHeader *)(ptr - sizeof(tBlockHeader));
+	
+	size = pBlockHeader->size;
+	 
+	if (size >= HOARD_THRESHOLD_MEM_SIZE)
+	{
+		deallocateLargeMemoryChunk(ptr, size + sizeof(tBlockHeader));
+	}
+
+	/* find where this block came from */
+	pMySuperblock = pBlockHeader->pMySuperblock;
+	heapNum = pMySuperblock->ownerHeap;
+	
+	pBlockHeader->inUse = 0;
+	/* attach this block to the head of the free list */	
+	pBlockHeader->pNextFree = pMySuperblock->pFreeBlocksHead;
+	pMySuperblock->pFreeBlocksHead = pBlockHeader;
+	pMySuperblock->numFreeBlocks++;
+	
+	/* keep superblocks ordered by fullness */
+	reorderSuperblockInClass(heapNum, pMySuperblock->sizeClass, pMySuperblock);
+	
+	if (pMySuperblock->numFreeBlocks == pMySuperblock->numBlocks)
+	{
+		/* An empty superblock container, recycle it! */
+		recycleSuperblock(heapNum, RECYCLED_CLASS, pMySuperblock);
+	}
+	
+	/* Check heap invariants, if necessary move superblock to global heap */		
+	checkInvariantAndMoveSuperblocks(heapNum);	
 }
 
 /*
@@ -462,6 +496,8 @@ static void * allocMem(unsigned int heapNum, unsigned int sizeClass)
 	p = allocFromFreeBlockInHeap(GLOBAL_HEAP, sizeClass);
 	if (p)
 	{
+		/* move superblock to appropriate size class in regular heap */
+		moveSuperblockFromTo(GLOBAL_HEAP, heapNum, ((tBlockHeader *)(p - sizeof(tBlockHeader)))->pMySuperblock);
 		DBG_EXIT;
 		return p;
 	}
@@ -510,7 +546,6 @@ static void * allocFromFreeBlockInHeap(unsigned int heapNum, unsigned int sizeCl
 static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned int sizeClass)
 {
 	tSuperblock		*pNewSuperblock;
-	tSuperblock		*pEmptyEnoughSuperblock;
 	void			*p;
 		
 	DBG_ENTRY;
@@ -530,22 +565,13 @@ static void *allocFromFreeBlockInNewSuperblock(unsigned int heapNum, unsigned in
 		DBG_EXIT;
 		return 0;
 	}
-	//dumpHoard("before addSuperblockToClass");		
+
 	/* Now attach the new superblock to the correct size class */
 	addSuperblockToClass(heapNum, sizeClass, pNewSuperblock);
-	//dumpHoard("after addSuperblockToClass");
-	/* Check heap invariants, if necessary move superblock to global heap */
-		
-	pEmptyEnoughSuperblock = findEmptyEnoughSuperblock(heapNum);
-	DBG_MSG("pEmptyEnoughSuperblock=0x%x\n", (unsigned int)pEmptyEnoughSuperblock);
-	
-	while (pEmptyEnoughSuperblock  && isEmptyEnough(heapNum))
-	{
-		/* move superblock to global heap */
-		moveSuperblockFromTo(heapNum, GLOBAL_HEAP, pNewSuperblock);
-		pEmptyEnoughSuperblock = findEmptyEnoughSuperblock(heapNum);		
-	}
-		
+
+	/* Check heap invariants, if necessary move superblock to global heap */		
+	checkInvariantAndMoveSuperblocks(heapNum);		
+			
 	DBG_EXIT;
 	return p;
 }
@@ -581,8 +607,7 @@ static int isEmptyEnough(unsigned int heapNum)
 	{
 		return 0;
 	}
-	/* The emptiness invariant holds */
-	
+	/* The emptiness invariant holds */	
 	return 1;
 }
 
@@ -604,7 +629,7 @@ static tSuperblock *findEmptyEnoughSuperblock(unsigned int heapNum)
 		pSizeClass = &pHeap->sizeClasses[sizeClassIdx];
 		/* just check the tail since the list is ordered from full to least full */
 		pSuperblock = pSizeClass->pTail;
-		DBG_MSG("sizeClassIdx=%d pSuperblock=0x%x\n",sizeClassIdx, (unsigned int)pSuperblock);
+		//DBG_MSG("sizeClassIdx=%d pSuperblock=0x%x\n",sizeClassIdx, (unsigned int)pSuperblock);
 		if (pSuperblock && ((pSuperblock->numFreeBlocks/pSuperblock->numBlocks) > FULLNESS_THRESHOLD_F))
 		{
 			DBG_EXIT;
@@ -739,12 +764,19 @@ static void removeSuperblockFromClass(unsigned int heapNum, unsigned int sizeCla
 	if (!pSuperblock->pNext)
 	{
 		pSizeClass->pTail = pSuperblock->pPrev;	
-	}
-	
-	
+	}	
 	DBG_EXIT;
 }
 
+/* Keep sorted-from-fullest-to-emptiest list of superblocks sorted upon malloc or free */
+static void reorderSuperblockInClass(unsigned int heapNum, unsigned int sizeClass, tSuperblock *pSuperblock)
+{
+	DBG_ENTRY;
+	/* just remove from linked list and put back in to keep it ordered. */
+	removeSuperblockFromClass(heapNum, sizeClass, pSuperblock);
+	addSuperblockToClass(heapNum, sizeClass, pSuperblock);
+	DBG_EXIT;
+}
 /* allocate one block of memory from the given superblock */
 void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass)
 {
@@ -762,7 +794,7 @@ void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass)
 	
 	if (RECYCLED_CLASS == pSuperblock->sizeClass)
 	{
-		recycleSuperblock(pSuperblock, pSuperblock->ownerHeap, requestedSizeClass);
+		recycleSuperblock(pSuperblock->ownerHeap, requestedSizeClass, pSuperblock);
 	}
 	
 	/* user memory block has a header right before it. This is the 'trick' for finding block info on free*/
@@ -777,11 +809,14 @@ void * allocBlock(tSuperblock *pSuperblock, unsigned int requestedSizeClass)
 	pSuperblock->numFreeBlocks--;
 	updateMemoryUsed(pSuperblock->ownerHeap, pSuperblock->blockSize);
 	
+	/* This block's superblock might need to change its place in the ordered list */
+	reorderSuperblockInClass(pSuperblock->ownerHeap, requestedSizeClass, pSuperblock);
+	
 	DBG_EXIT;
 	return p;
 }
 
-static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, unsigned int newSizeClass)
+static void recycleSuperblock(unsigned int heapNum, unsigned int newSizeClass, tSuperblock *pSuperblock)
 {	
 	DBG_ENTRY;
 	
@@ -806,6 +841,20 @@ static void recycleSuperblock(tSuperblock *pSuperblock, unsigned int heapNum, un
 	DBG_EXIT;
 }
 
+static void checkInvariantAndMoveSuperblocks(unsigned int heapNum)
+{	
+	tSuperblock *pEmptyEnoughSuperblock;
+	
+	pEmptyEnoughSuperblock = findEmptyEnoughSuperblock(heapNum);
+	DBG_MSG("pEmptyEnoughSuperblock=0x%x\n", (unsigned int)pEmptyEnoughSuperblock);
+	
+	while (pEmptyEnoughSuperblock  && isEmptyEnough(heapNum))
+	{
+		/* move superblock to global heap */
+		moveSuperblockFromTo(heapNum, GLOBAL_HEAP, pEmptyEnoughSuperblock);
+		pEmptyEnoughSuperblock = findEmptyEnoughSuperblock(heapNum);		
+	}
+}		
 
 static void dumpHoard(char *title)
 {
