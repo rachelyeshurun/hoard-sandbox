@@ -32,7 +32,7 @@ void * run_test (void *);
 void *dummy (unsigned);
 
 static unsigned long size = 512;
-static unsigned long iteration_count = 1000000;
+static unsigned long iteration_count = 1;
 static unsigned int thread_count = 1;
 
 #include "ptbarrier.h"
